@@ -1,3 +1,5 @@
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -8,11 +10,76 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/sockets.h"
+#include <lwip/netdb.h>
+
 #define TAG         "rebound"
 #define AP_SSID     "esp32"
 #define AP_PASS     "passw0rd"
 #define AP_CHAN     1
 #define AP_MAX_CONN 1
+
+#define TCP_PORT               9000
+#define TCP_KEEPALIVE_IDLE     5
+#define TCP_KEEPALIVE_INTERVAL 5
+#define TCP_KEEPALIVE_COUNT    3
+
+static int tcp_server_init(void)
+{
+	int err;
+	struct sockaddr_storage dest_addr;
+
+	struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
+	dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
+	dest_addr_ip4->sin_family = AF_INET;
+	dest_addr_ip4->sin_port = htons(TCP_PORT);
+
+	int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+	if (listen_sock < 0) {
+		ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+		return -1;
+	}
+
+	int flags = fcntl(listen_sock, F_GETFL);
+	if (flags < 0) {
+		ESP_LOGE(TAG, "Unable to get flags: errno %d", errno);
+		goto err;
+	}
+
+	err = fcntl(listen_sock, F_SETFL, flags | O_NONBLOCK);
+	if (err != 0) {
+		ESP_LOGE(TAG, "Unable to set nonblock: errno %d", errno);
+		goto err;
+	}
+
+	int opt = 1;
+	setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+	ESP_LOGI(TAG, "Socket created");
+
+	err = bind(listen_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+	if (err != 0) {
+		ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
+		ESP_LOGE(TAG, "IPPROTO: %d", AF_INET);
+		goto err;
+	}
+	ESP_LOGI(TAG, "Socket bound, port %d", TCP_PORT);
+
+	// TODO: Is backlog = 1 OK?
+	err = listen(listen_sock, 1);
+	if (err != 0) {
+		ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
+		goto err;
+	}
+
+	return listen_sock;
+
+err:
+	close(listen_sock);
+	return -1;
+}
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 		int32_t event_id, void* event_data)
@@ -65,6 +132,12 @@ void wifi_init_ap(void)
 	ESP_LOGI(TAG, "wifi_init_ap done.");
 }
 
+struct connection {
+	struct sockaddr_storage addr;
+	socklen_t addr_len;
+	int fd;
+};
+
 void app_main(void)
 {
 	printf("Hello, world!");
@@ -80,7 +153,36 @@ void app_main(void)
 	ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
 	wifi_init_ap();
 
+	struct connection *conn = NULL;
+	int listen_fd = tcp_server_init();
+	if (listen_fd < 0) {
+		ESP_LOGE(TAG, "tcp init failed.");
+	}
+
 	while (1) {
-		vTaskDelay(portMAX_DELAY);
+		if (conn == NULL) {
+			conn = malloc(sizeof(*conn));
+			*conn = (struct connection){ 0 };
+			conn->addr_len = sizeof(conn->addr);
+		}
+
+		conn->fd = accept(listen_fd, (struct sockaddr *)&conn->addr, &conn->addr_len);
+		if (conn->fd >= 0) {
+			// Handle connection
+			char addr_str[128];
+			inet_ntoa_r(((struct sockaddr_in *)&conn->addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+			ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
+
+			// TODO: Pass off to handler thread.
+
+			shutdown(conn->fd, SHUT_RDWR);
+			close(conn->fd);
+			free(conn);
+			conn = NULL;
+		} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			ESP_LOGE(TAG, "Accept failed: errno %d", errno);
+		}
+
+		vTaskDelay(100 / portTICK_PERIOD_MS);
 	}
 }
