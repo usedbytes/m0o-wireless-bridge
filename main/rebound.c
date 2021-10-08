@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_netif.h"
 #include "esp_system.h"
@@ -28,6 +29,11 @@
 #define TCP_KEEPALIVE_IDLE     5
 #define TCP_KEEPALIVE_INTERVAL 5
 #define TCP_KEEPALIVE_COUNT    3
+
+#define LED_PIN_R  16
+#define LED_PIN_G  17
+#define LED_PIN_B  18
+#define LED_PIN_B2 19
 
 #define UART_NUM      UART_NUM_1
 #define UART_BUF_SIZE 1024
@@ -119,10 +125,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 		wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
 		ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
 				MAC2STR(event->mac), event->aid);
+		gpio_set_level(LED_PIN_B2, 0);
 	} else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
 		wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
 		ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d",
 				MAC2STR(event->mac), event->aid);
+		gpio_set_level(LED_PIN_B2, 1);
 	}
 }
 
@@ -172,9 +180,13 @@ static void free_connection(struct connection *conn)
 
 static void handler_task(void *pvParameters)
 {
+	bool led = 0;
 	event_t event;
 	struct connection *current_conn = NULL;
 	for(;;) {
+		gpio_set_level(LED_PIN_R, led);
+		led = !led;
+
 		if (!(xQueueReceive(event_queue, (void * )&event, 30 / portTICK_PERIOD_MS))) {
 			if (current_conn != NULL) {
 				// Pump socket
@@ -184,15 +196,19 @@ static void handler_task(void *pvParameters)
 					ESP_LOGI(TAG, "%d from socket", len);
 					ESP_LOGI(TAG, "[UART TX DATA]:");
 					ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
+					gpio_set_level(LED_PIN_B, 0);
 					uart_write_bytes(UART_NUM, (const char*)data, len);
+					gpio_set_level(LED_PIN_B, 1);
 				} else if (len == 0) {
 					ESP_LOGI(TAG, "Socket closed");
 					free_connection(current_conn);
 					current_conn = NULL;
+					gpio_set_level(LED_PIN_G, 1);
 				} else if (errno != EAGAIN || errno != EWOULDBLOCK) {
 					ESP_LOGE(TAG, "Socket error: %d", errno);
 					free_connection(current_conn);
 					current_conn = NULL;
+					gpio_set_level(LED_PIN_G, 1);
 				}
 			}
 
@@ -204,6 +220,7 @@ static void handler_task(void *pvParameters)
 			switch(event.uart.type) {
 			case UART_DATA:
 				ESP_LOGI(TAG, "[UART DATA]: %d", event.uart.size);
+				gpio_set_level(LED_PIN_B, 0);
 				while (event.uart.size > 0) {
 					char data[128];
 					int size = event.uart.size > sizeof(data) ? sizeof(data) : event.uart.size;
@@ -224,6 +241,7 @@ static void handler_task(void *pvParameters)
 
 					event.uart.size -= size;
 				}
+				gpio_set_level(LED_PIN_B, 1);
 				break;
 			case UART_FIFO_OVF:
 				ESP_LOGI(TAG, "hw fifo overflow");
@@ -260,6 +278,7 @@ static void handler_task(void *pvParameters)
 					free_connection(current_conn);
 				}
 				current_conn = event.tcp.data;
+				gpio_set_level(LED_PIN_G, 0);
 				break;
 			default:
 				ESP_LOGI(TAG, "tcp event type: %d", event.tcp.type);
@@ -274,15 +293,19 @@ static void handler_task(void *pvParameters)
 				ESP_LOGI(TAG, "%d from socket", len);
 				ESP_LOGI(TAG, "[UART TX DATA]:");
 				ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
+				gpio_set_level(LED_PIN_B, 0);
 				uart_write_bytes(UART_NUM, (const char*)data, len);
+				gpio_set_level(LED_PIN_B, 1);
 			} else if (len == 0) {
 				ESP_LOGI(TAG, "Socket closed");
 				free_connection(current_conn);
 				current_conn = NULL;
+				gpio_set_level(LED_PIN_G, 1);
 			} else if (errno != EAGAIN || errno != EWOULDBLOCK) {
 				ESP_LOGE(TAG, "Socket error: %d", errno);
 				free_connection(current_conn);
 				current_conn = NULL;
+				gpio_set_level(LED_PIN_G, 1);
 			}
 		}
 	}
@@ -311,6 +334,20 @@ void app_main(void)
 	//esp_log_level_set(TAG, ESP_LOG_WARN);
 	printf("Hello, world!\n");
 	fflush(stdout);
+
+	gpio_config_t gpio_conf = {
+		.intr_type = GPIO_INTR_DISABLE,
+		.mode = GPIO_MODE_OUTPUT,
+		.pin_bit_mask = (1 << LED_PIN_R) | (1 << LED_PIN_G) | (1 << LED_PIN_B) | (1 << LED_PIN_B2),
+		.pull_down_en = 0,
+		.pull_up_en = 0,
+	};
+	gpio_config(&gpio_conf);
+
+	gpio_set_level(LED_PIN_R, 1);
+	gpio_set_level(LED_PIN_G, 1);
+	gpio_set_level(LED_PIN_B, 1);
+	gpio_set_level(LED_PIN_B2, 1);
 
 	esp_err_t ret = nvs_flash_init();
 	if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
