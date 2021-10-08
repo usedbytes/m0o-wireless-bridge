@@ -35,6 +35,28 @@
 #define UART_RX_PIN   4
 static QueueHandle_t event_queue;
 
+struct connection {
+	struct sockaddr_storage addr;
+	socklen_t addr_len;
+	int fd;
+};
+
+typedef enum {
+	TCP_NEW_CONN = UART_EVENT_MAX + 1,
+} tcp_event_type_t;
+
+typedef struct {
+	tcp_event_type_t type;
+	void *data;
+} tcp_event_t;
+
+typedef union {
+	uart_event_t uart;
+	tcp_event_t tcp;
+} event_t;
+// We're piggy-backing off the UART event queue, so we can't control the event size
+_Static_assert(sizeof(tcp_event_t) <= sizeof(uart_event_t), "TCP events can't be larger than UART events");
+
 static int tcp_server_init(void)
 {
 	int err;
@@ -141,55 +163,127 @@ void wifi_init_ap(void)
 	ESP_LOGI(TAG, "wifi_init_ap done.");
 }
 
+static void free_connection(struct connection *conn)
+{
+	shutdown(conn->fd, SHUT_RDWR);
+	close(conn->fd);
+	free(conn);
+}
+
 static void handler_task(void *pvParameters)
 {
-	uart_event_t event;
+	event_t event;
+	struct connection *current_conn = NULL;
 	for(;;) {
-		if (!(xQueueReceive(event_queue, (void * )&event, (portTickType)portMAX_DELAY))) {
-			// Impossible?
+		if (!(xQueueReceive(event_queue, (void * )&event, 30 / portTICK_PERIOD_MS))) {
+			if (current_conn != NULL) {
+				// Pump socket
+				char data[128];
+				int len = recv(current_conn->fd, data, sizeof(data), 0);
+				if (len > 0) {
+					ESP_LOGI(TAG, "%d from socket", len);
+					ESP_LOGI(TAG, "[UART TX DATA]:");
+					ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
+					uart_write_bytes(UART_NUM, (const char*)data, len);
+				} else if (len == 0) {
+					ESP_LOGI(TAG, "Socket closed");
+					free_connection(current_conn);
+					current_conn = NULL;
+				} else if (errno != EAGAIN || errno != EWOULDBLOCK) {
+					ESP_LOGE(TAG, "Socket error: %d", errno);
+					free_connection(current_conn);
+					current_conn = NULL;
+				}
+			}
+
 			continue;
 		}
 
-		ESP_LOGI(TAG, "uart[%d] event:", UART_NUM);
-		switch(event.type) {
-		case UART_DATA:
-			ESP_LOGI(TAG, "[UART DATA]: %d", event.size);
-			while (event.size > 0) {
-				char data[128];
-				int size = event.size > sizeof(data) ? sizeof(data) : event.size;
-				uart_read_bytes(UART_NUM, data, size, portMAX_DELAY);
-				ESP_LOGI(TAG, "[DATA EVT]:");
-				ESP_LOG_BUFFER_HEX(TAG, data, size);
-				uart_write_bytes(UART_NUM, (const char*)data, size);
-				event.size -= size;
+		if (event.uart.type <= UART_EVENT_MAX) {
+			ESP_LOGI(TAG, "uart[%d] event:", UART_NUM);
+			switch(event.uart.type) {
+			case UART_DATA:
+				ESP_LOGI(TAG, "[UART DATA]: %d", event.uart.size);
+				while (event.uart.size > 0) {
+					char data[128];
+					int size = event.uart.size > sizeof(data) ? sizeof(data) : event.uart.size;
+					uart_read_bytes(UART_NUM, data, size, portMAX_DELAY);
+					ESP_LOGI(TAG, "[UART RX DATA]:");
+					ESP_LOG_BUFFER_HEXDUMP(TAG, data, size, ESP_LOG_INFO);
+					if (current_conn != NULL) {
+						int to_write = size;
+						while (to_write > 0) {
+							int written = send(current_conn->fd, data + (size - to_write), to_write, 0);
+							if (written < 0) {
+								ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+								// TODO: Close conn here?
+							}
+							to_write -= written;
+						}
+					}
+
+					event.uart.size -= size;
+				}
+				break;
+			case UART_FIFO_OVF:
+				ESP_LOGI(TAG, "hw fifo overflow");
+				uart_flush_input(UART_NUM);
+				// TODO: We can't just reset if there's more than UART
+				// events in the queue
+				xQueueReset(event_queue);
+				break;
+			case UART_BUFFER_FULL:
+				ESP_LOGI(TAG, "ring buffer full");
+				uart_flush_input(UART_NUM);
+				// TODO: We can't just reset if there's more than UART
+				// events in the queue
+				xQueueReset(event_queue);
+				break;
+			case UART_BREAK:
+				ESP_LOGI(TAG, "uart rx break");
+				break;
+			case UART_PARITY_ERR:
+				ESP_LOGI(TAG, "uart parity error");
+				break;
+			case UART_FRAME_ERR:
+				ESP_LOGI(TAG, "uart frame error");
+				break;
+			default:
+				ESP_LOGI(TAG, "uart event type: %d", event.uart.type);
+				break;
 			}
-			break;
-		case UART_FIFO_OVF:
-			ESP_LOGI(TAG, "hw fifo overflow");
-			uart_flush_input(UART_NUM);
-			// TODO: We can't just reset if there's more than UART
-			// events in the queue
-			xQueueReset(event_queue);
-			break;
-		case UART_BUFFER_FULL:
-			ESP_LOGI(TAG, "ring buffer full");
-			uart_flush_input(UART_NUM);
-			// TODO: We can't just reset if there's more than UART
-			// events in the queue
-			xQueueReset(event_queue);
-			break;
-		case UART_BREAK:
-			ESP_LOGI(TAG, "uart rx break");
-			break;
-		case UART_PARITY_ERR:
-			ESP_LOGI(TAG, "uart parity error");
-			break;
-		case UART_FRAME_ERR:
-			ESP_LOGI(TAG, "uart frame error");
-			break;
-		default:
-			ESP_LOGI(TAG, "uart event type: %d", event.type);
-			break;
+		} else {
+			switch (event.tcp.type) {
+			case TCP_NEW_CONN:
+				ESP_LOGI(TAG, "received connection");
+				if (current_conn != NULL) {
+					free_connection(current_conn);
+				}
+				current_conn = event.tcp.data;
+				break;
+			default:
+				ESP_LOGI(TAG, "tcp event type: %d", event.tcp.type);
+			}
+		}
+
+		if (current_conn != NULL) {
+			// Pump socket
+			char data[128];
+			int len = recv(current_conn->fd, data, sizeof(data), 0);
+			if (len > 0) {
+				ESP_LOGI(TAG, "%d from socket", len);
+				ESP_LOGI(TAG, "[UART TX DATA]:");
+				ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
+				uart_write_bytes(UART_NUM, (const char*)data, len);
+			} else if (len == 0) {
+				ESP_LOGI(TAG, "Socket closed");
+				free_connection(current_conn);
+				current_conn = NULL;
+			} else if (errno != EAGAIN || errno != EWOULDBLOCK) {
+				ESP_LOGE(TAG, "Socket error: %d", errno);
+				free_connection(current_conn);
+				current_conn = NULL;
+			}
 		}
 	}
 	vTaskDelete(NULL);
@@ -212,15 +306,10 @@ void uart_init(void)
 	uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
-struct connection {
-	struct sockaddr_storage addr;
-	socklen_t addr_len;
-	int fd;
-};
-
 void app_main(void)
 {
-	printf("Hello, world!");
+	//esp_log_level_set(TAG, ESP_LOG_WARN);
+	printf("Hello, world!\n");
 	fflush(stdout);
 
 	esp_err_t ret = nvs_flash_init();
@@ -253,14 +342,37 @@ void app_main(void)
 		if (conn->fd >= 0) {
 			// Handle connection
 			char addr_str[128];
+			int keepAlive = 1;
+			int keepIdle = TCP_KEEPALIVE_IDLE;
+			int keepInterval = TCP_KEEPALIVE_INTERVAL;
+			int keepCount = TCP_KEEPALIVE_COUNT;
+
 			inet_ntoa_r(((struct sockaddr_in *)&conn->addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
 			ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
 
-			// TODO: Pass off to handler thread.
+			setsockopt(conn->fd, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
+			setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
+			setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
+			setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
 
-			shutdown(conn->fd, SHUT_RDWR);
-			close(conn->fd);
-			free(conn);
+			int flags = fcntl(conn->fd, F_GETFL);
+			if (flags < 0) {
+				ESP_LOGE(TAG, "Unable to get flags: errno %d", errno);
+			}
+
+			int err = fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK);
+			if (err != 0) {
+				ESP_LOGE(TAG, "Unable to set nonblock: errno %d", errno);
+			}
+
+			event_t event = {
+				.tcp = {
+					.type = TCP_NEW_CONN,
+					.data = conn,
+				},
+			};
+			// Pass off to handler thread.
+			xQueueSend(event_queue, &event, portMAX_DELAY);
 			conn = NULL;
 		} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
 			ESP_LOGE(TAG, "Accept failed: errno %d", errno);
