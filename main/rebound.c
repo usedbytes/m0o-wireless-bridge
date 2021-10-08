@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/uart.h"
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -25,6 +28,12 @@
 #define TCP_KEEPALIVE_IDLE     5
 #define TCP_KEEPALIVE_INTERVAL 5
 #define TCP_KEEPALIVE_COUNT    3
+
+#define UART_NUM      UART_NUM_1
+#define UART_BUF_SIZE 1024
+#define UART_TX_PIN   2
+#define UART_RX_PIN   4
+static QueueHandle_t event_queue;
 
 static int tcp_server_init(void)
 {
@@ -132,6 +141,77 @@ void wifi_init_ap(void)
 	ESP_LOGI(TAG, "wifi_init_ap done.");
 }
 
+static void handler_task(void *pvParameters)
+{
+	uart_event_t event;
+	for(;;) {
+		if (!(xQueueReceive(event_queue, (void * )&event, (portTickType)portMAX_DELAY))) {
+			// Impossible?
+			continue;
+		}
+
+		ESP_LOGI(TAG, "uart[%d] event:", UART_NUM);
+		switch(event.type) {
+		case UART_DATA:
+			ESP_LOGI(TAG, "[UART DATA]: %d", event.size);
+			while (event.size > 0) {
+				char data[128];
+				int size = event.size > sizeof(data) ? sizeof(data) : event.size;
+				uart_read_bytes(UART_NUM, data, size, portMAX_DELAY);
+				ESP_LOGI(TAG, "[DATA EVT]:");
+				ESP_LOG_BUFFER_HEX(TAG, data, size);
+				uart_write_bytes(UART_NUM, (const char*)data, size);
+				event.size -= size;
+			}
+			break;
+		case UART_FIFO_OVF:
+			ESP_LOGI(TAG, "hw fifo overflow");
+			uart_flush_input(UART_NUM);
+			// TODO: We can't just reset if there's more than UART
+			// events in the queue
+			xQueueReset(event_queue);
+			break;
+		case UART_BUFFER_FULL:
+			ESP_LOGI(TAG, "ring buffer full");
+			uart_flush_input(UART_NUM);
+			// TODO: We can't just reset if there's more than UART
+			// events in the queue
+			xQueueReset(event_queue);
+			break;
+		case UART_BREAK:
+			ESP_LOGI(TAG, "uart rx break");
+			break;
+		case UART_PARITY_ERR:
+			ESP_LOGI(TAG, "uart parity error");
+			break;
+		case UART_FRAME_ERR:
+			ESP_LOGI(TAG, "uart frame error");
+			break;
+		default:
+			ESP_LOGI(TAG, "uart event type: %d", event.type);
+			break;
+		}
+	}
+	vTaskDelete(NULL);
+}
+
+void uart_init(void)
+{
+	uart_config_t uart_config = {
+		.baud_rate = 115200,
+		.data_bits = UART_DATA_8_BITS,
+		.parity = UART_PARITY_DISABLE,
+		.stop_bits = UART_STOP_BITS_1,
+		.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+		.source_clk = UART_SCLK_APB,
+	};
+
+	uart_driver_install(UART_NUM, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 20, &event_queue, 0);
+	uart_param_config(UART_NUM, &uart_config);
+
+	uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
 struct connection {
 	struct sockaddr_storage addr;
 	socklen_t addr_len;
@@ -149,6 +229,9 @@ void app_main(void)
 		ret = nvs_flash_init();
 	}
 	ESP_ERROR_CHECK(ret);
+
+	uart_init();
+	xTaskCreate(handler_task, "handler_task", 2048, NULL, 12, NULL);
 
 	ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
 	wifi_init_ap();
