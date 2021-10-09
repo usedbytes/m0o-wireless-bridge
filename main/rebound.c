@@ -20,6 +20,7 @@
 #include <lwip/netdb.h>
 
 #define TAG         "rebound"
+#define LOG_LEVEL   ESP_LOG_WARN
 #define AP_SSID     "esp32"
 #define AP_PASS     "passw0rd"
 #define AP_CHAN     1
@@ -36,6 +37,7 @@
 #define LED_PIN_B2 19
 
 #define UART_NUM      UART_NUM_1
+#define UART_BAUD     576000
 #define UART_BUF_SIZE 1024
 #define UART_TX_PIN   2
 #define UART_RX_PIN   4
@@ -195,7 +197,7 @@ static void handler_task(void *pvParameters)
 				if (len > 0) {
 					ESP_LOGI(TAG, "%d from socket", len);
 					ESP_LOGI(TAG, "[UART TX DATA]:");
-					ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
+					//ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
 					gpio_set_level(LED_PIN_B, 0);
 					uart_write_bytes(UART_NUM, (const char*)data, len);
 					gpio_set_level(LED_PIN_B, 1);
@@ -225,7 +227,7 @@ static void handler_task(void *pvParameters)
 					int size = event.uart.size > sizeof(data) ? sizeof(data) : event.uart.size;
 					uart_read_bytes(UART_NUM, data, size, portMAX_DELAY);
 					ESP_LOGI(TAG, "[UART RX DATA]:");
-					ESP_LOG_BUFFER_HEXDUMP(TAG, data, size, ESP_LOG_INFO);
+					//ESP_LOG_BUFFER_HEXDUMP(TAG, data, size, ESP_LOG_INFO);
 					if (current_conn != NULL) {
 						int to_write = size;
 						while (to_write > 0) {
@@ -296,7 +298,7 @@ static void handler_task(void *pvParameters)
 			if (len > 0) {
 				ESP_LOGI(TAG, "%d from socket", len);
 				ESP_LOGI(TAG, "[UART TX DATA]:");
-				ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
+				//ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
 				gpio_set_level(LED_PIN_B, 0);
 				uart_write_bytes(UART_NUM, (const char*)data, len);
 				gpio_set_level(LED_PIN_B, 1);
@@ -319,7 +321,7 @@ static void handler_task(void *pvParameters)
 void uart_init(void)
 {
 	uart_config_t uart_config = {
-		.baud_rate = 115200,
+		.baud_rate = UART_BAUD,
 		.data_bits = UART_DATA_8_BITS,
 		.parity = UART_PARITY_DISABLE,
 		.stop_bits = UART_STOP_BITS_1,
@@ -335,7 +337,7 @@ void uart_init(void)
 
 void app_main(void)
 {
-	esp_log_level_set(TAG, ESP_LOG_WARN);
+	esp_log_level_set(TAG, LOG_LEVEL);
 	printf("Hello, world!\n");
 	fflush(stdout);
 
