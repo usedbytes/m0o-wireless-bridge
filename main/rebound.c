@@ -183,6 +183,7 @@ static void handler_task(void *pvParameters)
 	bool led = 0;
 	event_t event;
 	struct connection *current_conn = NULL;
+	static char data[1024];
 	for(;;) {
 		gpio_set_level(LED_PIN_R, led);
 		led = !led;
@@ -190,7 +191,6 @@ static void handler_task(void *pvParameters)
 		if (!(xQueueReceive(event_queue, (void * )&event, 30 / portTICK_PERIOD_MS))) {
 			if (current_conn != NULL) {
 				// Pump socket
-				char data[128];
 				int len = recv(current_conn->fd, data, sizeof(data), 0);
 				if (len > 0) {
 					ESP_LOGI(TAG, "%d from socket", len);
@@ -222,7 +222,6 @@ static void handler_task(void *pvParameters)
 				ESP_LOGI(TAG, "[UART DATA]: %d", event.uart.size);
 				gpio_set_level(LED_PIN_B, 0);
 				while (event.uart.size > 0) {
-					char data[128];
 					int size = event.uart.size > sizeof(data) ? sizeof(data) : event.uart.size;
 					uart_read_bytes(UART_NUM, data, size, portMAX_DELAY);
 					ESP_LOGI(TAG, "[UART RX DATA]:");
@@ -249,6 +248,9 @@ static void handler_task(void *pvParameters)
 				// TODO: We can't just reset if there's more than UART
 				// events in the queue
 				xQueueReset(event_queue);
+				free_connection(current_conn);
+				current_conn = NULL;
+				gpio_set_level(LED_PIN_G, 1);
 				break;
 			case UART_BUFFER_FULL:
 				ESP_LOGI(TAG, "ring buffer full");
@@ -256,6 +258,9 @@ static void handler_task(void *pvParameters)
 				// TODO: We can't just reset if there's more than UART
 				// events in the queue
 				xQueueReset(event_queue);
+				free_connection(current_conn);
+				current_conn = NULL;
+				gpio_set_level(LED_PIN_G, 1);
 				break;
 			case UART_BREAK:
 				ESP_LOGI(TAG, "uart rx break");
@@ -287,7 +292,6 @@ static void handler_task(void *pvParameters)
 
 		if (current_conn != NULL) {
 			// Pump socket
-			char data[128];
 			int len = recv(current_conn->fd, data, sizeof(data), 0);
 			if (len > 0) {
 				ESP_LOGI(TAG, "%d from socket", len);
@@ -331,7 +335,7 @@ void uart_init(void)
 
 void app_main(void)
 {
-	//esp_log_level_set(TAG, ESP_LOG_WARN);
+	esp_log_level_set(TAG, ESP_LOG_WARN);
 	printf("Hello, world!\n");
 	fflush(stdout);
 
