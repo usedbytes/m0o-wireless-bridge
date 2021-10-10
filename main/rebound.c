@@ -245,6 +245,7 @@ static void drain_uart_rx(struct handler_ctx *ctx, bool force_flush)
 
 	size_t avail = 0;
 	uart_get_buffered_data_len(UART_NUM, &avail);
+	ESP_LOGI(TAG, "%d bytes available", avail);
 
 	int to_read = avail > space ? space : avail;
 
@@ -303,7 +304,7 @@ static void handler_task(void *pvParameters)
 				drain_uart_rx(ctx, false);
 				break;
 			case UART_FIFO_OVF:
-				ESP_LOGI(TAG, "hw fifo overflow");
+				ESP_LOGE(TAG, "hw fifo overflow");
 				uart_flush_input(UART_NUM);
 				// TODO: We can't just reset if there's more than UART
 				// events in the queue
@@ -313,7 +314,7 @@ static void handler_task(void *pvParameters)
 				shutdown_connection(ctx);
 				break;
 			case UART_BUFFER_FULL:
-				ESP_LOGI(TAG, "ring buffer full");
+				ESP_LOGE(TAG, "ring buffer full");
 				uart_flush_input(UART_NUM);
 				// TODO: We can't just reset if there's more than UART
 				// events in the queue
@@ -326,7 +327,7 @@ static void handler_task(void *pvParameters)
 				ESP_LOGI(TAG, "uart rx break");
 				break;
 			case UART_PARITY_ERR:
-				ESP_LOGI(TAG, "uart parity error");
+				ESP_LOGE(TAG, "uart parity error");
 
 				uart_flush_input(UART_NUM);
 				// TODO: We can't just reset if there's more than UART
@@ -379,8 +380,9 @@ void uart_init(void)
 		.source_clk = UART_SCLK_APB,
 	};
 
-	uart_driver_install(UART_NUM, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 20, &event_queue, 0);
+	uart_driver_install(UART_NUM, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 100, &event_queue, 0);
 	uart_param_config(UART_NUM, &uart_config);
+	uart_set_rx_full_threshold(UART_NUM, 100);
 
 	uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
