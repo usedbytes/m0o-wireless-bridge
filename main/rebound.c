@@ -253,6 +253,7 @@ static void drain_uart_rx(struct handler_ctx *ctx, bool force_flush)
 	ctx->uart_rx_count += to_read;
 
 	if (ctx->conn == NULL) {
+		ctx->uart_rx_count = 0;
 		gpio_set_level(LED_PIN_B, 1);
 		return;
 	}
