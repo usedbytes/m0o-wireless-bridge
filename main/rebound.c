@@ -50,21 +50,6 @@
 static QueueHandle_t event_queue;
 static QueueHandle_t txn_queue;
 
-struct connection {
-	struct sockaddr_storage addr;
-	socklen_t addr_len;
-	int fd;
-};
-
-typedef enum {
-	TCP_NEW_CONN = UART_EVENT_MAX + 1,
-} tcp_event_type_t;
-
-typedef struct {
-	tcp_event_type_t type;
-	void *data;
-} tcp_event_t;
-
 typedef struct {
 	void *priv;
 	uint8_t *tx_data;
@@ -80,14 +65,6 @@ struct tcp_txn_priv {
 
 uint8_t tcp_rx_buf[4096];
 uint8_t rx_data[4096];
-
-typedef union {
-	uart_event_t uart;
-	tcp_event_t tcp;
-} event_t;
-
-// We're piggy-backing off the UART event queue, so we can't control the event size
-_Static_assert(sizeof(tcp_event_t) <= sizeof(uart_event_t), "TCP events can't be larger than UART events");
 
 static int tcp_server_init(void)
 {
@@ -197,108 +174,10 @@ void wifi_init_ap(void)
 	ESP_LOGI(TAG, "wifi_init_ap done.");
 }
 
-static void free_connection(struct connection *conn)
-{
-	shutdown(conn->fd, SHUT_RDWR);
-	close(conn->fd);
-	free(conn);
-}
-
-struct handler_ctx {
-	struct connection *conn;
-	int uart_rx_count;
-	uint8_t uart_rx_buf[UART_RX_BUF_SIZE];
-	uint8_t tcp_rx_buf[UART_TX_BUF_SIZE];
-};
-
 static void uart_tx(uint8_t *data, int len)
 {
 	gpio_set_level(LED_PIN_B, 0);
 	uart_write_bytes(UART_NUM, (const char*)data, len);
-	gpio_set_level(LED_PIN_B, 1);
-}
-
-static void receive_connection(struct handler_ctx *ctx, struct connection *conn)
-{
-	if (ctx->conn != NULL) {
-		free_connection(ctx->conn);
-	}
-	ctx->conn = conn;
-	gpio_set_level(LED_PIN_G, 0);
-}
-
-static void shutdown_connection(struct handler_ctx *ctx)
-{
-	if (!ctx->conn) {
-		return;
-	}
-
-	free_connection(ctx->conn);
-	ctx->conn = NULL;
-	gpio_set_level(LED_PIN_G, 1);
-}
-
-static void pump_socket(struct handler_ctx *ctx)
-{
-	if (!ctx->conn) {
-		return;
-	}
-
-	int len = recv(ctx->conn->fd, ctx->tcp_rx_buf, sizeof(ctx->tcp_rx_buf), 0);
-	if (len > 0) {
-		ESP_LOGI(TAG, "%d from socket", len);
-		ESP_LOGI(TAG, "[UART TX DATA]:");
-		//ESP_LOG_BUFFER_HEXDUMP(TAG, ctx->tcp_rx_buf, len, ESP_LOG_INFO);
-		uart_tx(ctx->tcp_rx_buf, len);
-	} else if (len == 0) {
-		ESP_LOGI(TAG, "Socket closed");
-		shutdown_connection(ctx);
-	} else if (errno != EAGAIN || errno != EWOULDBLOCK) {
-		ESP_LOGE(TAG, "Socket error: %d", errno);
-		shutdown_connection(ctx);
-	}
-}
-
-static void drain_uart_rx(struct handler_ctx *ctx, bool force_flush)
-{
-	gpio_set_level(LED_PIN_B, 0);
-
-	int space = sizeof(ctx->uart_rx_buf) - ctx->uart_rx_count;
-
-	size_t avail = 0;
-	uart_get_buffered_data_len(UART_NUM, &avail);
-	ESP_LOGI(TAG, "%d bytes available", avail);
-
-	int to_read = avail > space ? space : avail;
-
-	uart_read_bytes(UART_NUM, &ctx->uart_rx_buf[ctx->uart_rx_count], to_read, portMAX_DELAY);
-
-	ctx->uart_rx_count += to_read;
-
-	if (ctx->conn == NULL) {
-		ctx->uart_rx_count = 0;
-		gpio_set_level(LED_PIN_B, 1);
-		return;
-	}
-
-	if ((ctx->uart_rx_count >= UART_RX_FLUSH_THRESHOLD) || force_flush) {
-		int to_write = ctx->uart_rx_count;
-		while (to_write > 0) {
-			int written = send(ctx->conn->fd, ctx->uart_rx_buf + (ctx->uart_rx_count - to_write), to_write, 0);
-			if (written < 0) {
-				ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-
-				shutdown_connection(ctx);
-				ctx->uart_rx_count = 0;
-				gpio_set_level(LED_PIN_B, 1);
-				return;
-			}
-			to_write -= written;
-		}
-
-		ctx->uart_rx_count = 0;
-	}
-
 	gpio_set_level(LED_PIN_B, 1);
 }
 
@@ -546,95 +425,6 @@ static void tcp_handler_task(void *pvParameters)
 
 		vTaskDelay(100 / portTICK_PERIOD_MS);
 	}
-}
-
-static void handler_task(void *pvParameters)
-{
-	bool led = 0;
-	struct handler_ctx *ctx = pvParameters;
-	event_t event;
-	for(;;) {
-		gpio_set_level(LED_PIN_R, led);
-		led = !led;
-
-		if (!(xQueueReceive(event_queue, (void * )&event, 30 / portTICK_PERIOD_MS))) {
-			pump_socket(ctx);
-
-			drain_uart_rx(ctx, true);
-			continue;
-		}
-
-		if (event.uart.type <= UART_EVENT_MAX) {
-			ESP_LOGI(TAG, "uart[%d] event:", UART_NUM);
-			switch(event.uart.type) {
-			case UART_DATA:
-				ESP_LOGI(TAG, "[UART DATA]: %d", event.uart.size);
-				drain_uart_rx(ctx, false);
-				break;
-			case UART_FIFO_OVF:
-				ESP_LOGE(TAG, "hw fifo overflow");
-				uart_flush_input(UART_NUM);
-				// TODO: We can't just reset if there's more than UART
-				// events in the queue
-				xQueueReset(event_queue);
-
-				drain_uart_rx(ctx, true);
-				shutdown_connection(ctx);
-				break;
-			case UART_BUFFER_FULL:
-				ESP_LOGE(TAG, "ring buffer full");
-				uart_flush_input(UART_NUM);
-				// TODO: We can't just reset if there's more than UART
-				// events in the queue
-				xQueueReset(event_queue);
-
-				drain_uart_rx(ctx, true);
-				shutdown_connection(ctx);
-				break;
-			case UART_BREAK:
-				ESP_LOGI(TAG, "uart rx break");
-				break;
-			case UART_PARITY_ERR:
-				ESP_LOGE(TAG, "uart parity error");
-
-				uart_flush_input(UART_NUM);
-				// TODO: We can't just reset if there's more than UART
-				// events in the queue
-				xQueueReset(event_queue);
-
-				drain_uart_rx(ctx, true);
-				shutdown_connection(ctx);
-				break;
-			case UART_FRAME_ERR:
-				ESP_LOGI(TAG, "uart frame error");
-
-				uart_flush_input(UART_NUM);
-				// TODO: We can't just reset if there's more than UART
-				// events in the queue
-				xQueueReset(event_queue);
-
-				drain_uart_rx(ctx, true);
-				shutdown_connection(ctx);
-				break;
-			default:
-				ESP_LOGI(TAG, "uart event type: %d", event.uart.type);
-				break;
-			}
-		} else {
-			switch (event.tcp.type) {
-			case TCP_NEW_CONN:
-				ESP_LOGI(TAG, "received connection");
-				receive_connection(ctx, event.tcp.data);
-				break;
-			default:
-				ESP_LOGI(TAG, "tcp event type: %d", event.tcp.type);
-			}
-		}
-
-		// TODO: Maybe this slows UART receive down too much?
-		pump_socket(ctx);
-	}
-	vTaskDelete(NULL);
 }
 
 void uart_init(void)
