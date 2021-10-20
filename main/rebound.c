@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,7 +21,7 @@
 #include <lwip/netdb.h>
 
 #define TAG         "rebound"
-#define LOG_LEVEL   ESP_LOG_WARN
+#define LOG_LEVEL   ESP_LOG_INFO
 #define AP_SSID     "esp32"
 #define AP_PASS     "passw0rd"
 #define AP_CHAN     1
@@ -30,6 +31,7 @@
 #define TCP_KEEPALIVE_IDLE     5
 #define TCP_KEEPALIVE_INTERVAL 5
 #define TCP_KEEPALIVE_COUNT    3
+#define TCP_MAX_RX_LEN         2048
 
 #define LED_PIN_R  16
 #define LED_PIN_G  17
@@ -43,7 +45,10 @@
 #define UART_TX_PIN      2
 #define UART_RX_PIN      4
 #define UART_RX_FLUSH_THRESHOLD (UART_RX_BUF_SIZE / 2)
+#define UART_TIMEOUT_MS  100
+
 static QueueHandle_t event_queue;
+static QueueHandle_t txn_queue;
 
 struct connection {
 	struct sockaddr_storage addr;
@@ -60,10 +65,27 @@ typedef struct {
 	void *data;
 } tcp_event_t;
 
+typedef struct {
+	void *priv;
+	uint8_t *tx_data;
+	void (*rx_func)(void *priv, uint8_t *rx_data, uint16_t rx_len, bool error);
+	uint16_t tx_len;
+	uint16_t rx_len;
+} txn_event_t;
+
+struct tcp_txn_priv {
+	int fd;
+	TaskHandle_t tcp_task;
+};
+
+uint8_t tcp_rx_buf[4096];
+uint8_t rx_data[4096];
+
 typedef union {
 	uart_event_t uart;
 	tcp_event_t tcp;
 } event_t;
+
 // We're piggy-backing off the UART event queue, so we can't control the event size
 _Static_assert(sizeof(tcp_event_t) <= sizeof(uart_event_t), "TCP events can't be larger than UART events");
 
@@ -280,6 +302,252 @@ static void drain_uart_rx(struct handler_ctx *ctx, bool force_flush)
 	gpio_set_level(LED_PIN_B, 1);
 }
 
+static uint16_t uart_rx_into(uint8_t *buf, uint16_t len)
+{
+	size_t avail = 0;
+
+	gpio_set_level(LED_PIN_B, 0);
+
+	uart_get_buffered_data_len(UART_NUM, &avail);
+
+	avail = avail < len ? avail : len;
+
+	ESP_LOGI(TAG, "uart_rx_into, read %d bytes", avail);
+	uart_read_bytes(UART_NUM, buf, avail, portMAX_DELAY);
+
+	ESP_LOG_BUFFER_HEXDUMP(TAG, buf, avail, ESP_LOG_INFO);
+
+	gpio_set_level(LED_PIN_B, 1);
+
+	return avail;
+}
+
+static void uart_handler_error()
+{
+	uart_flush_input(UART_NUM);
+	xQueueReset(event_queue);
+}
+
+static void uart_handler_task(void *pvParameters)
+{
+	txn_event_t txn;
+	uart_event_t uart_event;
+
+	for ( ; ; ) {
+		// Everything is driven by transactions
+		ESP_LOGI(TAG, "Waiting for transaction");
+		xQueueReceive(txn_queue, (void *)&txn, portMAX_DELAY);
+		ESP_LOGI(TAG, "Transaction: %d bytes (%d)", txn.tx_len, txn.rx_len);
+
+		// Start with an empty RX buffer for every transaction
+		// TODO: Is this definitely what we want to do?
+		uart_flush_input(UART_NUM);
+
+		uart_tx(txn.tx_data, txn.tx_len);
+
+		uint16_t rx_count;
+		bool error;
+
+		TickType_t rx_start = xTaskGetTickCount();
+
+		for (rx_count = 0, error = false; rx_count < txn.rx_len && !error ; ) {
+			bool timeout = !xQueueReceive(event_queue, (void *)&uart_event, UART_TIMEOUT_MS / portTICK_PERIOD_MS);
+			if (timeout) {
+				TickType_t now = xTaskGetTickCount();
+				if (rx_count > 0 || ((now - rx_start) > (1000 / portTICK_PERIOD_MS))) {
+					// Timeout, send what we have
+					ESP_LOGI(TAG, "UART timeout after %d bytes\n", rx_count);
+					break;
+				}
+
+				continue;
+			}
+
+			switch(uart_event.type) {
+			case UART_DATA:
+				ESP_LOGI(TAG, "UART_DATA %d", uart_event.size);
+				ESP_LOGI(TAG, "rx_count: %d, rx_len: %d\n", rx_count, txn.rx_len);
+				rx_count += uart_rx_into(&rx_data[rx_count], txn.rx_len - rx_count);
+				break;
+			case UART_FIFO_OVF:
+				// Fallthrough
+			case UART_BUFFER_FULL:
+				// Fallthrough
+			case UART_PARITY_ERR:
+				// Fallthrough
+			case UART_FRAME_ERR:
+				uart_handler_error();
+				error = true;
+				break;
+			case UART_BREAK:
+				// TODO: Are we going to use break?
+				break;
+			default:
+				// Unexpected UART type
+				break;
+			}
+		}
+
+		ESP_LOGI(TAG, "Calling rx_func %d bytes %d\n", rx_count, error);
+		txn.rx_func(txn.priv, rx_data, rx_count, error);
+	}
+
+	vTaskDelete(NULL);
+}
+
+static void tcp_txn_rx_func(void *vpriv, uint8_t *rx_data, uint16_t rx_len, bool error)
+{
+	struct tcp_txn_priv *priv = (struct tcp_txn_priv *)vpriv;
+
+	ESP_LOGI(TAG, "tcp_txn_rx_func %d bytes %d\n", rx_len, error);
+
+	gpio_set_level(LED_PIN_B, 0);
+
+	if (error) {
+		shutdown(priv->fd, SHUT_RDWR);
+		close(priv->fd);
+
+		xTaskNotifyGive(priv->tcp_task);
+
+		gpio_set_level(LED_PIN_B, 1);
+		return;
+	}
+
+	int to_write = rx_len;
+	while (to_write > 0) {
+		ESP_LOGI(TAG, "writing %d bytes", to_write);
+		int written = send(priv->fd, rx_data + (rx_len - to_write), to_write, 0);
+		if (written < 0) {
+			ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+
+			shutdown(priv->fd, SHUT_RDWR);
+			close(priv->fd);
+
+			xTaskNotifyGive(priv->tcp_task);
+
+			gpio_set_level(LED_PIN_B, 1);
+			return;
+		}
+		to_write -= written;
+	}
+
+	ESP_LOGI(TAG, "Notify");
+	xTaskNotifyGive(priv->tcp_task);
+
+	gpio_set_level(LED_PIN_B, 1);
+}
+
+static void handle_connection(struct tcp_txn_priv *priv)
+{
+	gpio_set_level(LED_PIN_G, 0);
+	for (;;) {
+		int total_len = 4;
+		int received = 0;
+		for (received = 0; received < total_len; ) {
+			int len = recv(priv->fd, &tcp_rx_buf[received], total_len - received, 0);
+			if (len < 0) {
+				// TODO: Error return?
+				shutdown(priv->fd, SHUT_RDWR);
+				close(priv->fd);
+
+				gpio_set_level(LED_PIN_G, 1);
+				return;
+			}
+
+			received += len;
+
+			// TODO: Doing this every loop isn't strictly necessary.
+			// We could add a variable to track if we've received
+			// the length already.
+			// But, this is probably really cheap.
+			if (received >= 4) {
+				ESP_LOGI(TAG, "Received %d", received);
+				total_len = 4 + ((uint32_t *)tcp_rx_buf)[0];
+				ESP_LOGI(TAG, "Total len %d", total_len);
+				if (total_len >= sizeof(tcp_rx_buf)) {
+					ESP_LOGE(TAG, "Transaction too large: %d bytes", total_len);
+
+					shutdown(priv->fd, SHUT_RDWR);
+					close(priv->fd);
+
+					gpio_set_level(LED_PIN_G, 1);
+					return;
+				}
+			}
+		}
+
+
+		txn_event_t txn = {
+			.priv = priv,
+			// XXX: Careful of pointer arithmetic here.
+			.tx_data = tcp_rx_buf + 4,
+			.rx_func = tcp_txn_rx_func,
+			.tx_len = total_len - 4,
+			// TODO: Once we've plumbed in an rx_len, change this.
+			// For now, we'll rely on timeout (which will kill throughput,
+			// but means less changes to get this working).
+			.rx_len = TCP_MAX_RX_LEN,
+		};
+
+		ESP_LOGI(TAG, "Transaction %d bytes", txn.tx_len);
+		ESP_LOG_BUFFER_HEXDUMP(TAG, txn.tx_data, txn.tx_len, ESP_LOG_INFO);
+
+		xQueueSend(txn_queue, &txn, portMAX_DELAY);
+
+		// Block until complete, so we don't re-use fd or the buffer.
+		// We'll change this to be better later.
+		ESP_LOGI(TAG, "Waiting");
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		ESP_LOGI(TAG, "Woken");
+	}
+	gpio_set_level(LED_PIN_G, 1);
+}
+
+static void tcp_handler_task(void *pvParameters)
+{
+	struct tcp_txn_priv priv = {
+		.fd = -1,
+		.tcp_task = xTaskGetCurrentTaskHandle()
+	};
+
+	int listen_fd = tcp_server_init();
+	if (listen_fd < 0) {
+		ESP_LOGE(TAG, "tcp init failed.");
+		vTaskDelete(NULL);
+		return;
+	}
+
+	struct sockaddr_storage addr;
+	socklen_t addr_len;
+
+	for (;;) {
+		int fd = accept(listen_fd, (struct sockaddr *)&addr, &addr_len);
+		if (fd >= 0) {
+			char addr_str[128];
+			int keepAlive = 1;
+			int keepIdle = TCP_KEEPALIVE_IDLE;
+			int keepInterval = TCP_KEEPALIVE_INTERVAL;
+			int keepCount = TCP_KEEPALIVE_COUNT;
+
+			inet_ntoa_r(((struct sockaddr_in *)&addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+			ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
+
+			setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
+
+			priv.fd = fd;
+
+			handle_connection(&priv);
+		} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			ESP_LOGE(TAG, "Accept failed: errno %d", errno);
+		}
+
+		vTaskDelay(100 / portTICK_PERIOD_MS);
+	}
+}
+
 static void handler_task(void *pvParameters)
 {
 	bool led = 0;
@@ -416,65 +684,15 @@ void app_main(void)
 
 	uart_init();
 
-	static struct handler_ctx ctx = { 0 };
-	xTaskCreate(handler_task, "handler_task", 2048, &ctx, 12, NULL);
-
 	ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
 	wifi_init_ap();
 
-	struct connection *conn = NULL;
-	int listen_fd = tcp_server_init();
-	if (listen_fd < 0) {
-		ESP_LOGE(TAG, "tcp init failed.");
-	}
+	txn_queue = xQueueCreate(5, sizeof(txn_event_t));
+
+	xTaskCreate(uart_handler_task, "uart_task", 2048, NULL, 12, NULL);
+	xTaskCreate(tcp_handler_task, "tcp_task", 4096, NULL, 10, NULL);
 
 	while (1) {
-		if (conn == NULL) {
-			conn = malloc(sizeof(*conn));
-			*conn = (struct connection){ 0 };
-			conn->addr_len = sizeof(conn->addr);
-		}
-
-		conn->fd = accept(listen_fd, (struct sockaddr *)&conn->addr, &conn->addr_len);
-		if (conn->fd >= 0) {
-			// Handle connection
-			char addr_str[128];
-			int keepAlive = 1;
-			int keepIdle = TCP_KEEPALIVE_IDLE;
-			int keepInterval = TCP_KEEPALIVE_INTERVAL;
-			int keepCount = TCP_KEEPALIVE_COUNT;
-
-			inet_ntoa_r(((struct sockaddr_in *)&conn->addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
-			ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
-
-			setsockopt(conn->fd, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
-			setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
-			setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
-			setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
-
-			int flags = fcntl(conn->fd, F_GETFL);
-			if (flags < 0) {
-				ESP_LOGE(TAG, "Unable to get flags: errno %d", errno);
-			}
-
-			int err = fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK);
-			if (err != 0) {
-				ESP_LOGE(TAG, "Unable to set nonblock: errno %d", errno);
-			}
-
-			event_t event = {
-				.tcp = {
-					.type = TCP_NEW_CONN,
-					.data = conn,
-				},
-			};
-			// Pass off to handler thread.
-			xQueueSend(event_queue, &event, portMAX_DELAY);
-			conn = NULL;
-		} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-			ESP_LOGE(TAG, "Accept failed: errno %d", errno);
-		}
-
-		vTaskDelay(100 / portTICK_PERIOD_MS);
+		vTaskDelay(portMAX_DELAY);
 	}
 }
