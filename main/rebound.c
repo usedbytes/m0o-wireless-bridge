@@ -21,7 +21,7 @@
 #include <lwip/netdb.h>
 
 #define TAG         "rebound"
-#define LOG_LEVEL   ESP_LOG_INFO
+#define LOG_LEVEL   ESP_LOG_WARN
 #define AP_SSID     "esp32"
 #define AP_PASS     "passw0rd"
 #define AP_CHAN     1
