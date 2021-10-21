@@ -41,11 +41,12 @@
 #define UART_NUM         UART_NUM_1
 #define UART_BAUD        921600
 #define UART_RX_BUF_SIZE 2048
-#define UART_TX_BUF_SIZE 1024
+#define UART_TX_BUF_SIZE 0          // No TX ring buffer, all sends are blocking
 #define UART_TX_PIN      2
 #define UART_RX_PIN      4
 #define UART_RX_FLUSH_THRESHOLD (UART_RX_BUF_SIZE / 2)
-#define UART_TIMEOUT_MS  100
+#define UART_TIMEOUT_MS       1     // Time to wait for UART events
+#define UART_TIMEOUT_LONG_MS  100   // Max time to wait for a UART response
 
 static QueueHandle_t event_queue;
 static QueueHandle_t txn_queue;
@@ -224,8 +225,8 @@ static void uart_handler_task(void *pvParameters)
 
 		uart_tx(txn.tx_data, txn.tx_len);
 
-		uint16_t rx_count;
-		bool error;
+		uint16_t rx_count = 0;
+		bool error = false;
 
 		TickType_t rx_start = xTaskGetTickCount();
 
@@ -233,12 +234,21 @@ static void uart_handler_task(void *pvParameters)
 			bool timeout = !xQueueReceive(event_queue, (void *)&uart_event, UART_TIMEOUT_MS / portTICK_PERIOD_MS);
 			if (timeout) {
 				TickType_t now = xTaskGetTickCount();
-				if (rx_count > 0 || ((now - rx_start) > (1000 / portTICK_PERIOD_MS))) {
+
+				uint16_t in_fifo = uart_rx_into(&rx_data[rx_count], txn.rx_len - rx_count);
+				rx_count += in_fifo;
+
+				if (in_fifo > 0) {
+					// If there was data, wait for longer
+					continue;
+				} else if (rx_count > 0 || ((now - rx_start) > (UART_TIMEOUT_LONG_MS / portTICK_PERIOD_MS))) {
 					// Timeout, send what we have
 					ESP_LOGI(TAG, "UART timeout after %d bytes\n", rx_count);
 					break;
 				}
 
+				// Haven't received any data yet, and the long
+				// timeout hasn't been reached. Keep waiting
 				continue;
 			}
 
@@ -266,6 +276,9 @@ static void uart_handler_task(void *pvParameters)
 				break;
 			}
 		}
+
+		// One last attempt to drain anything in the ring buffer
+		rx_count += uart_rx_into(&rx_data[rx_count], txn.rx_len - rx_count);
 
 		ESP_LOGI(TAG, "Calling rx_func %d bytes %d\n", rx_count, error);
 		txn.rx_func(txn.priv, rx_data, rx_count, error);
