@@ -32,6 +32,7 @@
 #define TCP_KEEPALIVE_INTERVAL 5
 #define TCP_KEEPALIVE_COUNT    3
 #define TCP_MAX_RX_LEN         2048
+#define TCP_RX_SIZE_T          uint32_t
 
 #define LED_PIN_R  16
 #define LED_PIN_G  17
@@ -333,7 +334,7 @@ static void handle_connection(struct tcp_txn_priv *priv)
 {
 	gpio_set_level(LED_PIN_G, 0);
 	for (;;) {
-		int total_len = 4;
+		int total_len = sizeof(TCP_RX_SIZE_T);
 		int received = 0;
 		for (received = 0; received < total_len; ) {
 			int len = recv(priv->fd, &tcp_rx_buf[received], total_len - received, 0);
@@ -352,9 +353,9 @@ static void handle_connection(struct tcp_txn_priv *priv)
 			// We could add a variable to track if we've received
 			// the length already.
 			// But, this is probably really cheap.
-			if (received >= 4) {
+			if (received >= sizeof(TCP_RX_SIZE_T)) {
 				ESP_LOGI(TAG, "Received %d", received);
-				total_len = 4 + ((uint32_t *)tcp_rx_buf)[0];
+				total_len = sizeof(TCP_RX_SIZE_T) + ((TCP_RX_SIZE_T *)tcp_rx_buf)[0];
 				ESP_LOGI(TAG, "Total len %d", total_len);
 				if (total_len >= sizeof(tcp_rx_buf)) {
 					ESP_LOGE(TAG, "Transaction too large: %d bytes", total_len);
@@ -372,9 +373,9 @@ static void handle_connection(struct tcp_txn_priv *priv)
 		txn_event_t txn = {
 			.priv = priv,
 			// XXX: Careful of pointer arithmetic here.
-			.tx_data = tcp_rx_buf + 4,
+			.tx_data = tcp_rx_buf + sizeof(TCP_RX_SIZE_T),
 			.rx_func = tcp_txn_rx_func,
-			.tx_len = total_len - 4,
+			.tx_len = total_len - sizeof(TCP_RX_SIZE_T),
 			// TODO: Once we've plumbed in an rx_len, change this.
 			// For now, we'll rely on timeout (which will kill throughput,
 			// but means less changes to get this working).
