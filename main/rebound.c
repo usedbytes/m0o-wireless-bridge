@@ -15,6 +15,9 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
+#include "btstack_port_esp32.h"
+#include "btstack_run_loop.h"
+
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "lwip/sockets.h"
@@ -459,6 +462,16 @@ void uart_init(void)
 	uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
+extern int btstack_main(int argc, const char * argv[]);
+
+static void btstack_task(void *pvParameters)
+{
+	btstack_init();
+	btstack_main(0, NULL);
+
+	btstack_run_loop_execute();
+}
+
 void app_main(void)
 {
 	esp_log_level_set(TAG, LOG_LEVEL);
@@ -495,6 +508,10 @@ void app_main(void)
 
 	xTaskCreate(uart_handler_task, "uart_task", 2048, NULL, 12, NULL);
 	xTaskCreate(tcp_handler_task, "tcp_task", 4096, NULL, 10, NULL);
+
+	xTaskCreatePinnedToCore(btstack_task, "btstack", 4096, NULL, 5, NULL, 1);
+
+	//btstack_run_loop_execute();
 
 	while (1) {
 		vTaskDelay(portMAX_DELAY);
