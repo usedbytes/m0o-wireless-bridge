@@ -34,7 +34,12 @@
 #define TCP_KEEPALIVE_IDLE     5
 #define TCP_KEEPALIVE_INTERVAL 5
 #define TCP_KEEPALIVE_COUNT    3
-#define TCP_MAX_RX_LEN         2048
+
+// TODO: This is the max body size + 5 args + opcode.
+// Setting it to exactly this value means that LOG commands
+// will complete without needing to wait for timeout
+// It's a nasty hack.
+#define TCP_MAX_RX_LEN         (1024 + (5 * 4) + 4)
 #define TCP_RX_SIZE_T          uint32_t
 
 #define LED_PIN_R  16
@@ -48,8 +53,8 @@
 #define UART_TX_BUF_SIZE 0          // No TX ring buffer, all sends are blocking
 #define UART_TX_PIN      2
 #define UART_RX_PIN      4
-#define UART_RX_FLUSH_THRESHOLD (UART_RX_BUF_SIZE / 2)
-#define UART_TIMEOUT_MS       10    // Time to wait for UART events
+#define UART_RX_FLUSH_THRESHOLD (128)
+#define UART_TIMEOUT_MS       20    // Time to wait for UART events
 #define UART_TIMEOUT_LONG_MS  100   // Max time to wait for a UART response
 
 static QueueHandle_t event_queue;
@@ -213,6 +218,7 @@ static uint16_t uart_rx_into(uint8_t *buf, uint16_t len)
 
 static void uart_handler_error()
 {
+	ESP_LOGE(TAG, "uart_handler_error()");
 	uart_flush_input(UART_NUM);
 	xQueueReset(event_queue);
 }
@@ -314,10 +320,22 @@ static void tcp_txn_rx_func(void *vpriv, uint8_t *rx_data, uint16_t rx_len, bool
 		return;
 	}
 
+	uint32_t len = rx_len;
+	int written = send(priv->fd, &len, sizeof(len), 0);
+	if (written != sizeof(len)) {
+		shutdown(priv->fd, SHUT_RDWR);
+		close(priv->fd);
+
+		xTaskNotifyGive(priv->tcp_task);
+
+		gpio_set_level(LED_PIN_B, 1);
+		return;
+	}
+
 	int to_write = rx_len;
 	while (to_write > 0) {
 		ESP_LOGI(TAG, "writing %d bytes", to_write);
-		int written = send(priv->fd, rx_data + (rx_len - to_write), to_write, 0);
+		written = send(priv->fd, rx_data + (rx_len - to_write), to_write, 0);
 		if (written < 0) {
 			ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
 
@@ -328,6 +346,8 @@ static void tcp_txn_rx_func(void *vpriv, uint8_t *rx_data, uint16_t rx_len, bool
 
 			gpio_set_level(LED_PIN_B, 1);
 			return;
+		} else if (written < to_write) {
+			ESP_LOGE(TAG, "Short write %d vs %d", written, to_write);
 		}
 		to_write -= written;
 	}
@@ -548,7 +568,7 @@ uint8_t input_txn_data_bufs[INPUT_N_TXN_BUFS][INPUT_TXN_BUF_SIZE];
 
 static void input_queue_event(struct bt_hid_state *state)
 {
-	printf("L: %2x,%2x R: %2x,%2x, Hat: %1x, Buttons: %04x\n", state->lx, state->ly, state->rx, state->ry, state->hat, state->buttons);
+	//printf("L: %2x,%2x R: %2x,%2x, Hat: %1x, Buttons: %04x\n", state->lx, state->ly, state->rx, state->ry, state->hat, state->buttons);
 
 	uint8_t *buf;
 	xQueueReceive(input_buf_queue, &buf, portMAX_DELAY);
@@ -588,12 +608,9 @@ void input_task(void *pvParameters)
 
 		if (!input_is_synced()) {
 			input_attempt_sync();
-			if (!input_is_synced()) {
-				continue;
-			}
+		} else {
+			input_queue_event(&state);
 		}
-
-		input_queue_event(&state);
 	}
 
 	vTaskDelete(NULL);
@@ -637,7 +654,7 @@ void app_main(void)
 	xTaskCreate(tcp_handler_task, "tcp_task", 4096, NULL, 10, NULL);
 
 	bt_hid_task_params.state_queue = xQueueCreate(20, sizeof(struct bt_hid_state));
-	xTaskCreatePinnedToCore(bt_hid_task, "btstack", 4096, &bt_hid_task_params, 11, NULL, 1);
+	xTaskCreatePinnedToCore(bt_hid_task, "btstack", 4096, &bt_hid_task_params, 9, NULL, 1);
 	xTaskCreate(input_task, "bt_hid_state_task", 4096, &bt_hid_task_params, 10, NULL);
 
 	while (1) {
