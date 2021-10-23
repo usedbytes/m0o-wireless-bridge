@@ -135,6 +135,11 @@ static void hid_host_handle_interrupt_report(const uint8_t * report, uint16_t re
 	}
 }
 
+static void bt_hid_disconnected(bd_addr_t addr)
+{
+	gap_drop_link_key_for_bd_addr(addr);
+}
+
 static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
 	/* LISTING_PAUSE */
@@ -200,10 +205,12 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 							printf("Connection opened\n");
 							status = hid_subevent_connection_opened_get_status(packet);
 							if (status != ERROR_CODE_SUCCESS) {
-								printf("Connection failed, status 0x%x\n", status);
+								bd_addr_t addr;
+								hid_subevent_connection_opened_get_bd_addr(packet, addr);
+								printf("Connection failed, status 0x%x, %s\n", status, bd_addr_to_str(addr));
 								app_state = APP_IDLE;
 								hid_host_cid = 0;
-								gap_drop_link_key_for_bd_addr(remote_addr);
+								bt_hid_disconnected(addr);
 								return;
 							}
 							app_state = APP_CONNECTED;
@@ -268,7 +275,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 							hid_host_cid = 0;
 							hid_host_descriptor_available = false;
 							printf("HID Host disconnected.\n");
-							gap_drop_link_key_for_bd_addr(remote_addr);
+							bt_hid_disconnected(remote_addr);
 							break;
 
 						default:
@@ -294,7 +301,7 @@ int btstack_main(int argc, const char * argv[]){
 
     // parse human readable Bluetooth address
     sscanf_bd_addr(remote_addr_string, remote_addr);
-    gap_drop_link_key_for_bd_addr(remote_addr);
+    bt_hid_disconnected(remote_addr);
 
 #if 0 //HAVE_BTSTACK_STDIN
     btstack_stdin_setup(stdin_process);
