@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
@@ -48,11 +49,13 @@
 #define UART_TX_PIN      2
 #define UART_RX_PIN      4
 #define UART_RX_FLUSH_THRESHOLD (UART_RX_BUF_SIZE / 2)
-#define UART_TIMEOUT_MS       1     // Time to wait for UART events
+#define UART_TIMEOUT_MS       10    // Time to wait for UART events
 #define UART_TIMEOUT_LONG_MS  100   // Max time to wait for a UART response
 
 static QueueHandle_t event_queue;
 static QueueHandle_t txn_queue;
+static QueueHandle_t input_buf_queue;
+static EventGroupHandle_t input_flags;
 
 typedef struct {
 	void *priv;
@@ -184,6 +187,7 @@ static void uart_tx(uint8_t *data, int len)
 {
 	gpio_set_level(LED_PIN_B, 0);
 	uart_write_bytes(UART_NUM, (const char*)data, len);
+	ESP_LOG_BUFFER_HEXDUMP(TAG, data, len < 64 ? len : 64, ESP_LOG_INFO);
 	gpio_set_level(LED_PIN_B, 1);
 }
 
@@ -197,10 +201,10 @@ static uint16_t uart_rx_into(uint8_t *buf, uint16_t len)
 
 	avail = avail < len ? avail : len;
 
-	ESP_LOGI(TAG, "uart_rx_into, read %d bytes", avail);
+	ESP_LOGI(TAG, "uart_rx_into, read %d bytes %d)", avail, len);
 	uart_read_bytes(UART_NUM, buf, avail, portMAX_DELAY);
 
-	ESP_LOG_BUFFER_HEXDUMP(TAG, buf, avail, ESP_LOG_INFO);
+	ESP_LOG_BUFFER_HEXDUMP(TAG, buf, avail < 64 ? avail : 64, ESP_LOG_INFO);
 
 	gpio_set_level(LED_PIN_B, 1);
 
@@ -387,7 +391,7 @@ static void handle_connection(struct tcp_txn_priv *priv)
 		};
 
 		ESP_LOGI(TAG, "Transaction %d bytes", txn.tx_len);
-		ESP_LOG_BUFFER_HEXDUMP(TAG, txn.tx_data, txn.tx_len, ESP_LOG_INFO);
+		ESP_LOG_BUFFER_HEXDUMP(TAG, txn.tx_data, txn.tx_len < 64 ? txn.tx_len : 64, ESP_LOG_INFO);
 
 		xQueueSend(txn_queue, &txn, portMAX_DELAY);
 
@@ -463,17 +467,133 @@ void uart_init(void)
 	uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
-void bt_hid_state_task(void *pvParameters)
+#define CMD_INPUT    (('I' << 0) | ('N' << 8) | ('P' << 16) | ('T' << 24))
+#define CMD_SYNC     (('S' << 0) | ('Y' << 8) | ('N' << 16) | ('C' << 24))
+
+#define RSP_SYNC_BL  (('P' << 0) | ('I' << 8) | ('C' << 16) | ('O' << 24))
+#define RSP_SYNC_APP (('R' << 0) | ('B' << 8) | ('N' << 16) | ('D' << 24))
+#define RSP_OK       (('O' << 0) | ('K' << 8) | ('O' << 16) | ('K' << 24))
+#define RSP_ERR      (('E' << 0) | ('R' << 8) | ('R' << 16) | ('!' << 24))
+
+static void input_got_sync()
+{
+	ESP_LOGI(TAG, "input_got_sync");
+	xEventGroupSetBits(input_flags, 1);
+}
+
+static void input_lost_sync()
+{
+	ESP_LOGE(TAG, "input_lost_sync");
+	xEventGroupClearBits(input_flags, 1);
+}
+
+static bool input_is_synced()
+{
+	bool synced = xEventGroupGetBits(input_flags) & 1;
+	ESP_LOGI(TAG, "input_is_synced %d", synced);
+
+	return synced;
+}
+
+static void input_rx_func(void *vpriv, uint8_t *rx_data, uint16_t rx_len, bool error)
+{
+	uint32_t rsp;
+	uint8_t *buf = vpriv;
+	xQueueSend(input_buf_queue, &buf, portMAX_DELAY);
+
+	if (error || (rx_len != sizeof(rsp))) {
+		input_lost_sync();
+	}
+
+	memcpy(&rsp, rx_data, rx_len);
+
+	if (rsp == RSP_SYNC_APP) {
+		input_got_sync();
+	} else if (rsp != RSP_OK) {
+		input_lost_sync();
+	} else {
+		ESP_LOGI(TAG, "input rx OK");
+	}
+}
+
+static void input_attempt_sync()
+{
+	ESP_LOGI(TAG, "input attempt sync");
+
+	uint8_t *buf;
+	xQueueReceive(input_buf_queue, &buf, portMAX_DELAY);
+
+	uint32_t cmd = CMD_SYNC;
+	memcpy(buf, &cmd, sizeof(cmd));
+
+	txn_event_t txn = {
+		.priv = buf,
+		.tx_data = buf,
+		.rx_func = input_rx_func,
+		.tx_len = sizeof(cmd),
+		.rx_len = sizeof(cmd),
+	};
+
+	xQueueSend(txn_queue, &txn, portMAX_DELAY);
+
+	// Wait up to 10ms for sync
+	// TODO: This isn't really very good. 10ms is an eternity for input
+	// Probably we shouldn't block at all, just ask for sync and carry on
+	xEventGroupWaitBits(input_flags, 1, pdFALSE, pdFALSE, 10 / portTICK_PERIOD_MS);
+}
+
+#define INPUT_N_TXN_BUFS 16
+#define INPUT_TXN_BUF_SIZE (sizeof(uint32_t) + sizeof(struct bt_hid_state))
+uint8_t input_txn_data_bufs[INPUT_N_TXN_BUFS][INPUT_TXN_BUF_SIZE];
+
+static void input_queue_event(struct bt_hid_state *state)
+{
+	printf("L: %2x,%2x R: %2x,%2x, Hat: %1x, Buttons: %04x\n", state->lx, state->ly, state->rx, state->ry, state->hat, state->buttons);
+
+	uint8_t *buf;
+	xQueueReceive(input_buf_queue, &buf, portMAX_DELAY);
+
+	uint32_t cmd = CMD_INPUT;
+	memcpy(buf, &cmd, sizeof(cmd));
+	memcpy(buf + sizeof(cmd), state, sizeof(*state));
+
+	txn_event_t txn = {
+		.priv = buf,
+		.tx_data = buf,
+		.rx_func = input_rx_func,
+		.tx_len = INPUT_TXN_BUF_SIZE,
+		.rx_len = sizeof(cmd),
+	};
+
+	xQueueSend(txn_queue, &txn, portMAX_DELAY);
+}
+
+void input_task(void *pvParameters)
 {
 	struct bt_hid_task_params *params = (struct bt_hid_task_params *)pvParameters;
 	struct bt_hid_state state;
+
+	input_flags = xEventGroupCreate();
+	input_buf_queue = xQueueCreate(INPUT_N_TXN_BUFS, sizeof(uint8_t *));
+	int i;
+	for (i = 0; i < INPUT_N_TXN_BUFS; i++) {
+		uint8_t *addr = &input_txn_data_bufs[i][0];
+		xQueueSend(input_buf_queue, &addr, portMAX_DELAY);
+	}
 
 	while (1) {
 		if(!xQueueReceive(params->state_queue, (void *)&state, portMAX_DELAY)) {
 			continue;
 		}
 
-		printf("L: %2x,%2x R: %2x,%2x, Hat: %1x, Buttons: %04x\n", state.lx, state.ly, state.rx, state.ry, state.hat, state.buttons);
+		if (!input_is_synced()) {
+			input_attempt_sync();
+			if (!input_is_synced()) {
+				continue;
+			}
+		}
+
+		input_queue_event(&state);
 	}
 
 	vTaskDelete(NULL);
@@ -518,7 +638,7 @@ void app_main(void)
 
 	bt_hid_task_params.state_queue = xQueueCreate(20, sizeof(struct bt_hid_state));
 	xTaskCreatePinnedToCore(bt_hid_task, "btstack", 4096, &bt_hid_task_params, 11, NULL, 1);
-	xTaskCreate(bt_hid_state_task, "bt_hid_state_task", 4096, &bt_hid_task_params, 10, NULL);
+	xTaskCreate(input_task, "bt_hid_state_task", 4096, &bt_hid_task_params, 10, NULL);
 
 	while (1) {
 		vTaskDelay(portMAX_DELAY);
