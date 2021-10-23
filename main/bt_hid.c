@@ -40,10 +40,16 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 
+#include "btstack_port_esp32.h"
+#include "btstack_run_loop.h"
 #include "btstack_config.h"
 #include "btstack.h"
+
+#include "bt_hid.h"
 
 #define TAG "bt_hid"
 #define LOG_LEVEL   ESP_LOG_WARN
@@ -55,9 +61,10 @@ static const char * remote_addr_string = "E4:17:D8:EE:73:0E";
 // Real DS4
 // static const char * remote_addr_string = "00:22:68:DB:D3:66";
 
+static struct bt_hid_task_params *task_params;
+
 static bd_addr_t remote_addr;
 static bd_addr_t connected_addr;
-
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
 // SDP
@@ -88,10 +95,52 @@ static void hid_host_setup(void){
 	hci_add_event_handler(&hci_event_callback_registration);
 }
 
+/*
+ * Usage page: 0x1, 0x39, 0xf       HAT
+ * Usage page: 0x1, 0x30, 0x80      X (Lx)
+ * Usage page: 0x1, 0x31, 0x80      Y (Ly)
+ * Usage page: 0x1, 0x32, 0x80      Z (Rx)
+ * Usage page: 0x1, 0x35, 0x80      Rz (Ry)
+ * Usage page: 0x2, 0xc4, 0x0       Accelerator (R2)
+ * Usage page: 0x2, 0xc5, 0x0       Brake (L2)
+ * Usage page: 0x9, 0x1, 0x0        A (Circle)
+ * Usage page: 0x9, 0x2, 0x0        B (Cross)
+ * Usage page: 0x9, 0x3, 0x0
+ * Usage page: 0x9, 0x4, 0x0        X (Triangle)
+ * Usage page: 0x9, 0x5, 0x0        Y (Square)
+ * Usage page: 0x9, 0x6, 0x0
+ * Usage page: 0x9, 0x7, 0x0        L1
+ * Usage page: 0x9, 0x8, 0x0        R1
+ * Usage page: 0x9, 0x9, 0x0
+ * Usage page: 0x9, 0xa, 0x0
+ * Usage page: 0x9, 0xb, 0x0        Select
+ * Usage page: 0x9, 0xc, 0x0        Start
+ * Usage page: 0x9, 0xd, 0x0        Heart
+ * Usage page: 0x9, 0xe, 0x0        L3
+ * Usage page: 0x9, 0xf, 0x0        R3
+ * Usage page: 0x9, 0x10, 0x0
+*/
+#define USAGE_PAGE_DESKTOP  0x1
+#define USAGE_PAGE_SIM      0x2
+#define USAGE_PAGE_BUTTON   0x9
+
+#define DESKTOP_USAGE_HAT 0x39
+#define DESKTOP_USAGE_LX  0x30
+#define DESKTOP_USAGE_LY  0x31
+#define DESKTOP_USAGE_RX  0x32
+#define DESKTOP_USAGE_RY  0x35
+#define SIM_USAGE_R2      0xc4
+#define SIM_USAGE_L2      0xc5
+
 static void hid_host_handle_interrupt_report(const uint8_t * report, uint16_t report_len){
 	// check if HID Input Report
-	if (report_len < 1) return;
-	if (*report != 0xa1) return;
+	if (report_len < 1) {
+		return;
+	}
+
+	if (*report != 0xa1) {
+		return;
+	}
 
 	report++;
 	report_len--;
@@ -102,27 +151,87 @@ static void hid_host_handle_interrupt_report(const uint8_t * report, uint16_t re
 			hid_descriptor_storage_get_descriptor_len(hid_host_cid),
 			HID_REPORT_TYPE_INPUT, report, report_len);
 
-	int shift = 0;
+	struct bt_hid_state state = { 0 };
+
 	while (btstack_hid_parser_has_more(&parser)){
 		uint16_t usage_page;
 		uint16_t usage;
 		int32_t  value;
 		btstack_hid_parser_get_field(&parser, &usage_page, &usage, &value);
-		printf("Usage page: 0x%x, 0x%x, 0x%x\n", usage_page, usage, value);
-		if (usage_page != 0x07) continue;
-		switch (usage){
-			case 0xe1:
-			case 0xe6:
-				if (value){
-					shift = 1;
-				}
-				continue;
-			case 0x00:
-				continue;
-			default:
+
+		//printf("Page: 0x%x, Usage: 0x%x, Value: 0x%x\n", usage_page, usage, value);
+
+		switch (usage_page) {
+		case USAGE_PAGE_DESKTOP:
+			switch (usage) {
+			case DESKTOP_USAGE_HAT:
+				state.hat = value;
 				break;
+			case DESKTOP_USAGE_LX:
+				state.lx = value;
+				break;
+			case DESKTOP_USAGE_LY:
+				state.ly = value;
+				break;
+			case DESKTOP_USAGE_RX:
+				state.rx = value;
+				break;
+			case DESKTOP_USAGE_RY:
+				state.ry = value;
+				break;
+			}
+			break;
+		case USAGE_PAGE_SIM:
+			switch (usage) {
+			case SIM_USAGE_L2:
+				state.buttons |= (value ? (1 << BTN_BIT_L2) : 0);
+				break;
+			case SIM_USAGE_R2:
+				state.buttons |= (value ? (1 << BTN_BIT_R2) : 0);
+				break;
+			}
+			break;
+		case USAGE_PAGE_BUTTON:
+			switch (usage) {
+			case 0x1:
+				state.buttons |= (value ? (1 << BTN_BIT_A) : 0);
+				break;
+			case 0x2:
+				state.buttons |= (value ? (1 << BTN_BIT_B) : 0);
+				break;
+			case 0x4:
+				state.buttons |= (value ? (1 << BTN_BIT_X) : 0);
+				break;
+			case 0x5:
+				state.buttons |= (value ? (1 << BTN_BIT_Y) : 0);
+				break;
+			case 0x7:
+				state.buttons |= (value ? (1 << BTN_BIT_L1) : 0);
+				break;
+			case 0x8:
+				state.buttons |= (value ? (1 << BTN_BIT_R1) : 0);
+				break;
+			case 0xb:
+				state.buttons |= (value ? (1 << BTN_BIT_SELECT) : 0);
+				break;
+			case 0xc:
+				state.buttons |= (value ? (1 << BTN_BIT_START) : 0);
+				break;
+			case 0xd:
+				state.buttons |= (value ? (1 << BTN_BIT_HEART) : 0);
+				break;
+			case 0xe:
+				state.buttons |= (value ? (1 << BTN_BIT_L3) : 0);
+				break;
+			case 0xf:
+				state.buttons |= (value ? (1 << BTN_BIT_R3) : 0);
+				break;
+			}
+			break;
 		}
 	}
+
+	xQueueSend(task_params->state_queue, &state, portMAX_DELAY);
 }
 
 static void bt_hid_disconnected(bd_addr_t addr)
@@ -237,13 +346,15 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	}
 }
 
-int btstack_main(int argc, const char * argv[]);
-int btstack_main(int argc, const char * argv[]){
-
-	(void)argc;
-	(void)argv;
+void bt_hid_task(void *pvParameters)
+{
+	// Looks like btstack doesn't give us a way to pass this to the
+	// packet handler without a global.
+	task_params = (struct bt_hid_task_params *)pvParameters;
 
 	esp_log_level_set(TAG, LOG_LEVEL);
+
+	btstack_init();
 
 	hid_host_setup();
 
@@ -252,5 +363,8 @@ int btstack_main(int argc, const char * argv[]){
 
 	hci_power_control(HCI_POWER_ON);
 
-	return 0;
+	btstack_run_loop_execute();
+
+	// Run loop should never return, but just incase
+	vTaskDelete(NULL);
 }

@@ -15,13 +15,12 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
-#include "btstack_port_esp32.h"
-#include "btstack_run_loop.h"
-
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "lwip/sockets.h"
 #include <lwip/netdb.h>
+
+#include "bt_hid.h"
 
 #define TAG         "rebound"
 #define LOG_LEVEL   ESP_LOG_WARN
@@ -67,6 +66,8 @@ struct tcp_txn_priv {
 	int fd;
 	TaskHandle_t tcp_task;
 };
+
+static struct bt_hid_task_params bt_hid_task_params;
 
 uint8_t tcp_rx_buf[4096];
 uint8_t rx_data[4096];
@@ -462,14 +463,20 @@ void uart_init(void)
 	uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
-extern int btstack_main(int argc, const char * argv[]);
-
-static void btstack_task(void *pvParameters)
+void bt_hid_state_task(void *pvParameters)
 {
-	btstack_init();
-	btstack_main(0, NULL);
+	struct bt_hid_task_params *params = (struct bt_hid_task_params *)pvParameters;
+	struct bt_hid_state state;
 
-	btstack_run_loop_execute();
+	while (1) {
+		if(!xQueueReceive(params->state_queue, (void *)&state, portMAX_DELAY)) {
+			continue;
+		}
+
+		printf("L: %2x,%2x R: %2x,%2x, Hat: %1x, Buttons: %04x\n", state.lx, state.ly, state.rx, state.ry, state.hat, state.buttons);
+	}
+
+	vTaskDelete(NULL);
 }
 
 void app_main(void)
@@ -509,9 +516,9 @@ void app_main(void)
 	xTaskCreate(uart_handler_task, "uart_task", 2048, NULL, 12, NULL);
 	xTaskCreate(tcp_handler_task, "tcp_task", 4096, NULL, 10, NULL);
 
-	xTaskCreatePinnedToCore(btstack_task, "btstack", 4096, NULL, 5, NULL, 1);
-
-	//btstack_run_loop_execute();
+	bt_hid_task_params.state_queue = xQueueCreate(20, sizeof(struct bt_hid_state));
+	xTaskCreatePinnedToCore(bt_hid_task, "btstack", 4096, &bt_hid_task_params, 11, NULL, 1);
+	xTaskCreate(bt_hid_state_task, "bt_hid_state_task", 4096, &bt_hid_task_params, 10, NULL);
 
 	while (1) {
 		vTaskDelay(portMAX_DELAY);
