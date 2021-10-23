@@ -132,6 +132,16 @@ static void hid_host_setup(void){
 #define SIM_USAGE_R2      0xc4
 #define SIM_USAGE_L2      0xc5
 
+const struct bt_hid_state default_state = {
+	.buttons = 0,
+	.lx = 0x80,
+	.ly = 0x80,
+	.rx = 0x80,
+	.ry = 0x80,
+	.hat = 0xf,
+	.pad = 0x0,
+};
+
 static void hid_host_handle_interrupt_report(const uint8_t * report, uint16_t report_len){
 	// check if HID Input Report
 	if (report_len < 1) {
@@ -239,6 +249,8 @@ static void bt_hid_disconnected(bd_addr_t addr)
 	hid_host_cid = 0;
 	hid_host_descriptor_available = false;
 	gap_drop_link_key_for_bd_addr(addr);
+
+	xQueueSend(task_params->state_queue, &default_state, portMAX_DELAY);
 }
 
 static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
