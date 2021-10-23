@@ -53,6 +53,7 @@
 #include "ble/le_device_db_tlv.h"
 #include "classic/btstack_link_key_db.h"
 #include "classic/btstack_link_key_db_tlv.h"
+#include "classic/btstack_link_key_db_memory.h"
 #include "hci.h"
 #include "hci_dump.h"
 #include "esp_bt.h"
@@ -373,7 +374,8 @@ uint8_t btstack_init(void){
     btstack_tlv_set_instance(btstack_tlv_impl, NULL);
 
     // setup Link Key DB using TLV
-    const btstack_link_key_db_t * btstack_link_key_db = btstack_link_key_db_tlv_get_instance(btstack_tlv_impl, NULL);
+    //const btstack_link_key_db_t * btstack_link_key_db = btstack_link_key_db_tlv_get_instance(btstack_tlv_impl, NULL);
+    const btstack_link_key_db_t * btstack_link_key_db = btstack_link_key_db_memory_instance();
     hci_set_link_key_db(btstack_link_key_db);
 
     // setup LE Device DB using TLV
